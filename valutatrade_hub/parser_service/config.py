@@ -2,11 +2,20 @@
 
 API-ключи, эндпоинты, списки валют, параметры запросов.
 Чувствительные данные (API-ключ) загружаются
-из переменных окружения.
+из переменных окружения (файл .env).
 """
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Загружаем .env из корня проекта
+_ENV_PATH = (
+    Path(__file__).resolve().parents[2] / ".env"
+)
+load_dotenv(_ENV_PATH)
 
 
 @dataclass
