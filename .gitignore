@@ -195,6 +195,10 @@ cython_debug/
 data/*.log
 logs/
 
+# Demo artifacts
+*.cast
+generate_demo.py
+
 # PyPI configuration file
 .pypirc
 
