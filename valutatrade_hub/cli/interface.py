@@ -1,53 +1,122 @@
-"""CLI interface: command loop and handlers for ValutaTrade Hub."""
+"""Командный интерфейс (CLI) для ValutaTrade Hub.
+
+CLI является единственной точкой входа для пользовательских
+команд. Внутри CLI не дублируется бизнес-логика — только
+вызовы методов из core/usecases.py.
+"""
 
 import shlex
 import sys
 
-from prettytable import PrettyTable
-
-from valutatrade_hub.core.exceptions import (
-    ApiRequestError,
-    AuthenticationError,
-    CurrencyNotFoundError,
-    InsufficientFundsError,
-    RatesExpiredError,
-    UserAlreadyExistsError,
-    UserNotFoundError,
-    ValutaTradeError,
-)
+from valutatrade_hub.core import usecases
 from valutatrade_hub.core.models import Portfolio, User
-from valutatrade_hub.core.usecases import (
-    buy_currency,
-    get_portfolio_info,
-    get_rate,
-    login_user,
-    register_user,
-    sell_currency,
-)
-from valutatrade_hub.infra.database import DatabaseManager
-from valutatrade_hub.infra.settings import SettingsLoader
-from valutatrade_hub.parser_service.updater import RatesUpdater
 
 HELP_TEXT = """
-Available commands:
-  register <username> <password>  - Register a new account
-  login <username> <password>     - Log in to your account
-  logout                          - Log out
-  show-portfolio                  - Display your portfolio
-  buy <currency> <amount>         - Buy currency using USD
-  sell <currency> <amount>        - Sell currency for USD
-  get-rate <currency>             - Show exchange rate for a currency
-  update-rates                    - Fetch latest rates from APIs
-  show-rates                      - Show all current exchange rates
-  help                            - Show this help message
-  exit / quit                     - Exit the application
+Доступные команды:
+  register --username <имя> --password <пароль>
+  login --username <имя> --password <пароль>
+  logout
+  show-portfolio [--base <валюта>]
+  buy --currency <код> --amount <кол-во>
+  sell --currency <код> --amount <кол-во>
+  get-rate --from <валюта> --to <валюта>
+  help
+  exit / quit
 """.strip()
 
 
-def _parse_command(raw: str) -> tuple[str, list[str]]:
-    """Parse a raw input string into command and arguments.
+def run_cli() -> None:
+    """Главный цикл командного интерфейса."""
+    current_user: User | None = None
+    current_portfolio: Portfolio | None = None
 
-    Uses shlex.split with posix=False on Windows for compatibility.
+    print("=" * 50)
+    print("  ValutaTrade Hub")
+    print("  Введите 'help' для списка команд.")
+    print("=" * 50)
+
+    while True:
+        try:
+            prompt = ""
+            if current_user:
+                prompt = f"[{current_user.username}] "
+            raw = input(f"\n{prompt}> ").strip()
+            if not raw:
+                continue
+
+            cmd, args = _parse_input(raw)
+            flags = _parse_flags(args)
+
+            if cmd in ("exit", "quit"):
+                print("До свидания!")
+                break
+
+            if cmd == "help":
+                print(HELP_TEXT)
+
+            elif cmd == "register":
+                _handle_register(flags)
+
+            elif cmd == "login":
+                result = _handle_login(flags)
+                if result:
+                    current_user = result[0]
+                    current_portfolio = result[1]
+
+            elif cmd == "logout":
+                current_user = None
+                current_portfolio = None
+                print("Вы вышли из аккаунта.")
+
+            elif cmd == "show-portfolio":
+                _require_login(current_user)
+                _handle_show_portfolio(
+                    current_user,
+                    current_portfolio,
+                    flags,
+                )
+
+            elif cmd == "buy":
+                _require_login(current_user)
+                current_portfolio = _handle_buy(
+                    current_portfolio, flags
+                )
+
+            elif cmd == "sell":
+                _require_login(current_user)
+                current_portfolio = _handle_sell(
+                    current_portfolio, flags
+                )
+
+            elif cmd == "get-rate":
+                _handle_get_rate(flags)
+
+            else:
+                print(
+                    f"Неизвестная команда: '{cmd}'. "
+                    "Введите 'help' для справки."
+                )
+
+        except KeyboardInterrupt:
+            print("\nДо свидания!")
+            break
+        except EOFError:
+            print("\nДо свидания!")
+            break
+        except ValueError as exc:
+            print(f"Ошибка: {exc}")
+
+
+# ── Парсинг ввода ────────────────────────────────────────
+
+
+def _parse_input(
+    raw: str,
+) -> tuple[str, list[str]]:
+    """Разобрать строку на команду и аргументы.
+
+    Использует shlex для безопасного разбора строки.
+    На Windows отключает POSIX-режим для совместимости.
     """
     posix = sys.platform != "win32"
     parts = shlex.split(raw, posix=posix)
@@ -56,263 +125,167 @@ def _parse_command(raw: str) -> tuple[str, list[str]]:
     return parts[0].lower(), parts[1:]
 
 
-def _require_login(
-    user: User | None, portfolio: Portfolio | None
-) -> tuple[User, Portfolio]:
-    """Check that a user is logged in.
+def _parse_flags(
+    args: list[str],
+) -> dict[str, str]:
+    """Разобрать аргументы вида --key value в словарь.
+
+    Args:
+        args: Список токенов после команды.
+
+    Returns:
+        Словарь {ключ: значение}.
+    """
+    flags: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--") and len(arg) > 2:
+            key = arg[2:]
+            if (
+                i + 1 < len(args)
+                and not args[i + 1].startswith("--")
+            ):
+                flags[key] = args[i + 1]
+                i += 2
+            else:
+                flags[key] = ""
+                i += 1
+        else:
+            i += 1
+    return flags
+
+
+def _require_login(user: User | None) -> None:
+    """Проверить, что пользователь авторизован.
 
     Raises:
-        ValutaTradeError: If not logged in.
+        ValueError: Если не выполнен login.
     """
-    if user is None or portfolio is None:
-        raise ValutaTradeError(
-            "You must log in first. Use: login <username> <password>"
+    if user is None:
+        raise ValueError("Сначала выполните login")
+
+
+# ── Обработчики команд ───────────────────────────────────
+
+
+def _handle_register(flags: dict) -> None:
+    """Обработать команду register."""
+    username = flags.get("username", "").strip()
+    password = flags.get("password", "").strip()
+
+    if not username or not password:
+        print(
+            "Использование: register "
+            "--username <имя> --password <пароль>"
         )
-    return user, portfolio
-
-
-# ── Command Handlers ──────────────────────────────────────
-
-
-def handle_register(
-    args: list[str],
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> tuple[User, Portfolio]:
-    """Handle the 'register' command."""
-    if len(args) < 2:
-        print("Usage: register <username> <password>")
-        raise ValueError("Missing arguments")
-    username, password = args[0], args[1]
-    user, portfolio = register_user(username, password, db, settings)
-    print(f"User '{username}' registered successfully!")
-    print(f"Starting balance: {settings.initial_balance:.2f} {settings.base_currency}")
-    return user, portfolio
-
-
-def handle_login(
-    args: list[str],
-    db: DatabaseManager,
-) -> tuple[User, Portfolio]:
-    """Handle the 'login' command."""
-    if len(args) < 2:
-        print("Usage: login <username> <password>")
-        raise ValueError("Missing arguments")
-    username, password = args[0], args[1]
-    user, portfolio = login_user(username, password, db)
-    print(f"Welcome back, {username}!")
-    return user, portfolio
-
-
-def handle_show_portfolio(
-    user: User | None,
-    portfolio: Portfolio | None,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> None:
-    """Handle the 'show-portfolio' command."""
-    user, portfolio = _require_login(user, portfolio)
-    info = get_portfolio_info(portfolio, db, settings)
-
-    table = PrettyTable()
-    table.field_names = ["Currency", "Balance", "Value (USD)"]
-    table.align["Currency"] = "l"
-    table.align["Balance"] = "r"
-    table.align["Value (USD)"] = "r"
-
-    for w in info["wallets"]:
-        table.add_row([
-            w["currency"],
-            f"{w['balance']:.4f}",
-            f"{w['value_usd']:.2f}",
-        ])
-
-    print(f"\nPortfolio for {info['username']}:")
-    print(table)
-    print(f"Total value: {info['total_value_usd']:.2f} USD")
-    print(f"Rates updated: {info['rates_updated_at']}")
-
-
-def handle_buy(
-    args: list[str],
-    user: User | None,
-    portfolio: Portfolio | None,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> Portfolio:
-    """Handle the 'buy' command."""
-    user, portfolio = _require_login(user, portfolio)
-    if len(args) < 2:
-        print("Usage: buy <currency> <amount>")
-        raise ValueError("Missing arguments")
-
-    currency = args[0]
-    try:
-        amount = float(args[1])
-    except ValueError:
-        raise ValueError(f"Invalid amount: '{args[1]}'") from None
-
-    result = buy_currency(portfolio, currency, amount, db, settings)
-    print(result)
-    return portfolio
-
-
-def handle_sell(
-    args: list[str],
-    user: User | None,
-    portfolio: Portfolio | None,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> Portfolio:
-    """Handle the 'sell' command."""
-    user, portfolio = _require_login(user, portfolio)
-    if len(args) < 2:
-        print("Usage: sell <currency> <amount>")
-        raise ValueError("Missing arguments")
-
-    currency = args[0]
-    try:
-        amount = float(args[1])
-    except ValueError:
-        raise ValueError(f"Invalid amount: '{args[1]}'") from None
-
-    result = sell_currency(portfolio, currency, amount, db, settings)
-    print(result)
-    return portfolio
-
-
-def handle_get_rate(
-    args: list[str],
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> None:
-    """Handle the 'get-rate' command."""
-    if len(args) < 1:
-        print("Usage: get-rate <currency>")
-        raise ValueError("Missing arguments")
-
-    info = get_rate(args[0], db, settings)
-    print(
-        f"1 {info['currency']} = {info['rate_usd']:.4f} {info['base']}  "
-        f"(updated: {info['updated_at']})"
-    )
-
-
-def handle_update_rates(settings: SettingsLoader) -> None:
-    """Handle the 'update-rates' command."""
-    print("Fetching latest exchange rates...")
-    updater = RatesUpdater(settings)
-    rates = updater.run_update()
-    print(f"Updated {len(rates)} exchange rates successfully!")
-
-
-def handle_show_rates(
-    db: DatabaseManager,
-) -> None:
-    """Handle the 'show-rates' command."""
-    rates_data = db.load_rates()
-    rates = rates_data.get("rates", {})
-    updated_at = rates_data.get("updated_at", "N/A")
-
-    if not rates:
-        print("No rates available. Run 'update-rates' first.")
         return
 
-    table = PrettyTable()
-    table.field_names = ["Currency", "1 Unit = USD"]
-    table.align["Currency"] = "l"
-    table.align["1 Unit = USD"] = "r"
-
-    for currency in sorted(rates.keys()):
-        table.add_row([currency, f"{rates[currency]:.4f}"])
-
-    print(f"\nExchange Rates (base: USD, updated: {updated_at}):")
-    print(table)
+    msg = usecases.register_user(username, password)
+    print(msg)
 
 
-# ── Main CLI Loop ─────────────────────────────────────────
+def _handle_login(
+    flags: dict,
+) -> tuple[User, Portfolio] | None:
+    """Обработать команду login."""
+    username = flags.get("username", "").strip()
+    password = flags.get("password", "").strip()
+
+    if not username or not password:
+        print(
+            "Использование: login "
+            "--username <имя> --password <пароль>"
+        )
+        return None
+
+    user, portfolio = usecases.login_user(
+        username, password
+    )
+    print(f"Вы вошли как '{username}'")
+    return user, portfolio
 
 
-def run_cli() -> None:
-    """Run the interactive command-line interface."""
-    settings = SettingsLoader()
-    db = DatabaseManager(settings)
+def _handle_show_portfolio(
+    user: User,
+    portfolio: Portfolio,
+    flags: dict,
+) -> None:
+    """Обработать команду show-portfolio."""
+    base = flags.get("base", "USD").upper()
+    result = usecases.show_portfolio(
+        user, portfolio, base
+    )
+    print(result)
 
-    current_user: User | None = None
-    current_portfolio: Portfolio | None = None
 
-    print("=" * 50)
-    print("  Welcome to ValutaTrade Hub!")
-    print("  Type 'help' for available commands.")
-    print("=" * 50)
+def _handle_buy(
+    portfolio: Portfolio, flags: dict
+) -> Portfolio:
+    """Обработать команду buy."""
+    currency = flags.get("currency", "").strip().upper()
+    amount_str = flags.get("amount", "").strip()
 
-    while True:
-        try:
-            prompt = (
-                f"[{current_user.username}] " if current_user else ""
-            )
-            raw = input(f"\n{prompt}ValutaTrade> ").strip()
-            if not raw:
-                continue
+    if not currency or not amount_str:
+        print(
+            "Использование: buy "
+            "--currency <код> --amount <кол-во>"
+        )
+        return portfolio
 
-            command, args = _parse_command(raw)
+    try:
+        amount = float(amount_str)
+    except ValueError:
+        raise ValueError(
+            f"'{amount_str}' не является числом"
+        ) from None
 
-            if command in ("exit", "quit"):
-                print("Goodbye!")
-                break
-            elif command == "help":
-                print(HELP_TEXT)
-            elif command == "register":
-                current_user, current_portfolio = handle_register(
-                    args, db, settings
-                )
-            elif command == "login":
-                current_user, current_portfolio = handle_login(args, db)
-            elif command == "logout":
-                current_user = None
-                current_portfolio = None
-                print("Logged out successfully.")
-            elif command == "show-portfolio":
-                handle_show_portfolio(
-                    current_user, current_portfolio, db, settings
-                )
-            elif command == "buy":
-                current_portfolio = handle_buy(
-                    args, current_user, current_portfolio, db, settings
-                )
-            elif command == "sell":
-                current_portfolio = handle_sell(
-                    args, current_user, current_portfolio, db, settings
-                )
-            elif command == "get-rate":
-                handle_get_rate(args, db, settings)
-            elif command == "update-rates":
-                handle_update_rates(settings)
-            elif command == "show-rates":
-                handle_show_rates(db)
-            else:
-                print(
-                    f"Unknown command: '{command}'. "
-                    "Type 'help' for available commands."
-                )
+    portfolio, msg = usecases.buy_currency(
+        portfolio, currency, amount
+    )
+    print(msg)
+    return portfolio
 
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
-        except EOFError:
-            print("\nGoodbye!")
-            break
-        except (
-            InsufficientFundsError,
-            CurrencyNotFoundError,
-            UserNotFoundError,
-            UserAlreadyExistsError,
-            AuthenticationError,
-            RatesExpiredError,
-            ApiRequestError,
-        ) as exc:
-            print(f"Error: {exc}")
-        except ValueError as exc:
-            print(f"Input error: {exc}")
-        except ValutaTradeError as exc:
-            print(f"Error: {exc}")
+
+def _handle_sell(
+    portfolio: Portfolio, flags: dict
+) -> Portfolio:
+    """Обработать команду sell."""
+    currency = flags.get("currency", "").strip().upper()
+    amount_str = flags.get("amount", "").strip()
+
+    if not currency or not amount_str:
+        print(
+            "Использование: sell "
+            "--currency <код> --amount <кол-во>"
+        )
+        return portfolio
+
+    try:
+        amount = float(amount_str)
+    except ValueError:
+        raise ValueError(
+            f"'{amount_str}' не является числом"
+        ) from None
+
+    portfolio, msg = usecases.sell_currency(
+        portfolio, currency, amount
+    )
+    print(msg)
+    return portfolio
+
+
+def _handle_get_rate(flags: dict) -> None:
+    """Обработать команду get-rate."""
+    from_c = flags.get("from", "").strip().upper()
+    to_c = flags.get("to", "").strip().upper()
+
+    if not from_c or not to_c:
+        print(
+            "Использование: get-rate "
+            "--from <валюта> --to <валюта>"
+        )
+        return
+
+    result = usecases.get_rate(from_c, to_c)
+    print(result)

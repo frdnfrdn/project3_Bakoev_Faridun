@@ -1,6 +1,28 @@
 {
-  "base": "USD",
-  "rates": {},
-  "updated_at": null,
-  "last_refresh": null
+  "EUR_USD": {
+    "rate": 1.0786,
+    "updated_at": "2026-02-15T12:00:00"
+  },
+  "BTC_USD": {
+    "rate": 59337.21,
+    "updated_at": "2026-02-15T12:00:00"
+  },
+  "RUB_USD": {
+    "rate": 0.01016,
+    "updated_at": "2026-02-15T12:00:00"
+  },
+  "ETH_USD": {
+    "rate": 3720.00,
+    "updated_at": "2026-02-15T12:00:00"
+  },
+  "GBP_USD": {
+    "rate": 1.2700,
+    "updated_at": "2026-02-15T12:00:00"
+  },
+  "JPY_USD": {
+    "rate": 0.00667,
+    "updated_at": "2026-02-15T12:00:00"
+  },
+  "source": "stub",
+  "last_refresh": "2026-02-15T12:00:00"
 }

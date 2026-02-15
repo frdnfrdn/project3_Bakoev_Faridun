@@ -9,15 +9,15 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "prettytable (>=3.17.0,<4.0.0)",
-    "requests (>=2.32.0,<3.0.0)",
 ]
 
 [project.scripts]
-project = "valutatrade_hub.main:main"
+project = "main:main"
 
 [tool.poetry]
 packages = [
     { include = "valutatrade_hub" },
+    { include = "main.py" },
 ]
 
 [build-system]

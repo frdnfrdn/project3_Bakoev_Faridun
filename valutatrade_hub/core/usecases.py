@@ -1,338 +1,510 @@
-"""Business logic usecases: register, login, buy, sell, get_rate."""
+"""Бизнес-логика: регистрация, авторизация, покупка/продажа, курсы."""
 
-import logging
 from datetime import datetime
 
-from valutatrade_hub.core.exceptions import (
-    AuthenticationError,
-    CurrencyNotFoundError,
-    RatesExpiredError,
-    UserAlreadyExistsError,
-    UserNotFoundError,
-)
 from valutatrade_hub.core.models import Portfolio, User
-from valutatrade_hub.decorators import log_action
-from valutatrade_hub.infra.database import DatabaseManager
-from valutatrade_hub.infra.settings import SettingsLoader
+from valutatrade_hub.core.utils import (
+    PORTFOLIOS_FILE,
+    RATES_FILE,
+    USERS_FILE,
+    format_datetime,
+    generate_salt,
+    get_next_user_id,
+    hash_password,
+    load_json,
+    save_json,
+)
 
-logger = logging.getLogger(__name__)
+# Криптовалюты отображаются с 4 знаками после запятой
+_CRYPTO = {"BTC", "ETH", "SOL", "DOGE", "XRP", "LTC"}
 
 
-@log_action
-def register_user(
-    username: str,
-    password: str,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> tuple[User, Portfolio]:
-    """Register a new user and create an initial portfolio.
+def register_user(username: str, password: str) -> str:
+    """Зарегистрировать нового пользователя.
 
-    The user starts with an initial USD balance defined in settings.
+    1. Проверить уникальность username.
+    2. Сгенерировать user_id (автоинкремент).
+    3. Захешировать пароль (SHA-256 + соль).
+    4. Сохранить в users.json.
+    5. Создать пустой портфель в portfolios.json.
 
     Args:
-        username: Desired username.
-        password: User password (min 4 characters).
-        db: DatabaseManager instance.
-        settings: SettingsLoader instance.
+        username: Имя пользователя (непустое, уникальное).
+        password: Пароль (>= 4 символов).
 
     Returns:
-        Tuple of (User, Portfolio).
+        Сообщение об успехе.
 
     Raises:
-        UserAlreadyExistsError: If username is taken.
-        ValueError: If username/password is invalid.
+        ValueError: Имя занято или пароль короткий.
     """
-    users_data = db.load_users()
-    for u in users_data:
+    if len(password) < 4:
+        raise ValueError(
+            "Пароль должен быть не короче 4 символов"
+        )
+
+    users = load_json(USERS_FILE) or []
+    for u in users:
         if u["username"].lower() == username.lower():
-            raise UserAlreadyExistsError(
-                f"User '{username}' already exists"
+            raise ValueError(
+                f"Имя пользователя '{username}' уже занято"
             )
 
-    user = User(username, password)
-    users_data.append(user.to_dict())
-    db.save_users(users_data)
+    user_id = get_next_user_id(users)
+    salt = generate_salt()
+    hashed = hash_password(password, salt)
 
-    portfolio = Portfolio(user)
-    usd_wallet = portfolio.add_currency(settings.base_currency)
-    usd_wallet.deposit(settings.initial_balance)
-    db.save_portfolio(username, portfolio.to_dict())
-
-    logger.info(
-        "Registered user '%s' with %.2f USD",
-        username,
-        settings.initial_balance,
+    user = User(
+        user_id=user_id,
+        username=username,
+        hashed_password=hashed,
+        salt=salt,
+        registration_date=datetime.now().isoformat(),
     )
-    return user, portfolio
+    users.append(user.to_dict())
+    save_json(USERS_FILE, users)
+
+    portfolios = load_json(PORTFOLIOS_FILE) or []
+    portfolio = Portfolio(user_id=user_id)
+    portfolios.append(portfolio.to_dict())
+    save_json(PORTFOLIOS_FILE, portfolios)
+
+    return (
+        f"Пользователь '{username}' зарегистрирован "
+        f"(id={user_id}). "
+        f"Войдите: login --username {username} "
+        f"--password ****"
+    )
 
 
-@log_action
 def login_user(
-    username: str,
-    password: str,
-    db: DatabaseManager,
+    username: str, password: str
 ) -> tuple[User, Portfolio]:
-    """Authenticate a user and load their portfolio.
+    """Войти в систему.
+
+    1. Найти пользователя по username.
+    2. Сравнить хеш пароля.
 
     Args:
-        username: Username.
-        password: Password to verify.
-        db: DatabaseManager instance.
+        username: Имя пользователя.
+        password: Пароль.
 
     Returns:
-        Tuple of (User, Portfolio).
+        Кортеж (User, Portfolio).
 
     Raises:
-        UserNotFoundError: If user does not exist.
-        AuthenticationError: If password is wrong.
+        ValueError: Пользователь не найден или неверный пароль.
     """
-    users_data = db.load_users()
+    users = load_json(USERS_FILE) or []
     user_dict = None
-    for u in users_data:
+    for u in users:
         if u["username"].lower() == username.lower():
             user_dict = u
             break
 
     if user_dict is None:
-        raise UserNotFoundError(f"User '{username}' not found")
+        raise ValueError(
+            f"Пользователь '{username}' не найден"
+        )
 
     user = User.from_dict(user_dict)
     if not user.verify_password(password):
-        raise AuthenticationError("Invalid password")
+        raise ValueError("Неверный пароль")
 
-    portfolio_data = db.load_portfolio(username)
-    if portfolio_data:
-        portfolio = Portfolio.from_dict(portfolio_data, user)
-    else:
-        portfolio = Portfolio(user)
-
-    logger.info("User '%s' logged in", username)
+    portfolio = _load_portfolio(user.user_id)
     return user, portfolio
 
 
-def _load_and_validate_rates(
-    db: DatabaseManager, settings: SettingsLoader
-) -> dict[str, float]:
-    """Load rates from DB and check TTL.
+def show_portfolio(
+    user: User,
+    portfolio: Portfolio,
+    base_currency: str = "USD",
+) -> str:
+    """Показать портфель с оценкой в базовой валюте.
+
+    Args:
+        user: Текущий пользователь.
+        portfolio: Портфель пользователя.
+        base_currency: Валюта для оценки (по умолч. USD).
 
     Returns:
-        Dict of {currency: rate_in_usd}.
+        Отформатированная строка.
 
     Raises:
-        RatesExpiredError: If rates are stale or missing.
+        ValueError: Неизвестная базовая валюта.
     """
-    rates_data = db.load_rates()
-    rates = rates_data.get("rates", {})
-    updated_at = rates_data.get("updated_at")
+    rates = _load_rates()
 
-    if not rates:
-        raise RatesExpiredError(
-            "No exchange rates available. Run 'update-rates' first."
+    if base_currency != "USD":
+        key = f"{base_currency}_USD"
+        info = rates.get(key)
+        if not info or not isinstance(info, dict):
+            raise ValueError(
+                f"Неизвестная базовая валюта "
+                f"'{base_currency}'"
+            )
+
+    wallets = portfolio.wallets
+    if not wallets:
+        return (
+            f"Портфель пользователя "
+            f"'{user.username}' пуст."
         )
 
-    if updated_at:
-        try:
-            updated_time = datetime.fromisoformat(updated_at)
-            age_seconds = (datetime.now() - updated_time).total_seconds()
-            if age_seconds > settings.rates_ttl:
-                logger.warning(
-                    "Rates are %.0f seconds old (TTL: %d)",
-                    age_seconds,
-                    settings.rates_ttl,
-                )
-                raise RatesExpiredError(
-                    f"Exchange rates expired ({age_seconds:.0f}s old, "
-                    f"TTL: {settings.rates_ttl}s). "
-                    "Run 'update-rates' to refresh."
-                )
-        except ValueError:
-            pass
+    name = user.username
+    lines = [
+        f"Портфель пользователя '{name}' "
+        f"(база: {base_currency}):"
+    ]
 
-    return rates
+    total = 0.0
+    for code, wallet in wallets.items():
+        value = _convert_to_base(
+            code, wallet.balance, base_currency, rates
+        )
+        total += value
+        bal = _fmt_balance(wallet.balance, code)
+        lines.append(
+            f"  - {code}: {bal}  "
+            f"-> {value:.2f} {base_currency}"
+        )
+
+    lines.append("  " + "-" * 33)
+    lines.append(f"  ИТОГО: {total:,.2f} {base_currency}")
+    return "\n".join(lines)
 
 
-@log_action
 def buy_currency(
     portfolio: Portfolio,
-    currency: str,
+    currency_code: str,
     amount: float,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> str:
-    """Buy a specified amount of currency using USD.
+) -> tuple[Portfolio, str]:
+    """Купить валюту (добавить в портфель).
+
+    1. Валидировать currency и amount > 0.
+    2. Автосоздание кошелька при необходимости.
+    3. Увеличить баланс на amount.
+    4. Показать оценочную стоимость покупки.
 
     Args:
-        portfolio: User's portfolio.
-        currency: Currency code to buy (e.g. 'BTC').
-        amount: Amount of currency to buy.
-        db: DatabaseManager instance.
-        settings: SettingsLoader instance.
+        portfolio: Портфель пользователя.
+        currency_code: Код покупаемой валюты.
+        amount: Количество.
 
     Returns:
-        Success message string.
+        Кортеж (обновлённый Portfolio, сообщение).
 
     Raises:
-        ValueError: If amount is invalid.
-        CurrencyNotFoundError: If rate is not available.
-        InsufficientFundsError: If USD balance is too low.
-        RatesExpiredError: If rates are stale.
+        ValueError: Некорректная сумма.
     """
-    currency = currency.upper()
+    currency_code = currency_code.upper()
     if amount <= 0:
-        raise ValueError("Amount must be positive")
-
-    rates = _load_and_validate_rates(db, settings)
-
-    if currency not in rates:
-        raise CurrencyNotFoundError(
-            f"No exchange rate available for '{currency}'"
+        raise ValueError(
+            "'amount' должен быть положительным числом"
         )
 
-    rate = rates[currency]
-    cost_usd = amount * rate
+    rates = _load_rates()
+    rate_key = f"{currency_code}_USD"
+    rate_info = rates.get(rate_key)
 
-    usd_wallet = portfolio.add_currency("USD")
-    usd_wallet.withdraw(cost_usd)
+    wallet = portfolio.get_wallet(currency_code)
+    old_bal = wallet.balance if wallet else 0.0
 
-    target_wallet = portfolio.add_currency(currency)
-    target_wallet.deposit(amount)
+    if not wallet:
+        wallet = portfolio.add_currency(currency_code)
 
-    db.save_portfolio(portfolio.user.username, portfolio.to_dict())
+    wallet.deposit(amount)
+    new_bal = wallet.balance
+    _save_portfolio(portfolio)
 
-    return (
-        f"Bought {amount:.4f} {currency} for {cost_usd:.2f} USD "
-        f"(rate: 1 {currency} = {rate:.4f} USD)"
-    )
+    old_s = _fmt_balance(old_bal, currency_code)
+    new_s = _fmt_balance(new_bal, currency_code)
+    amt_s = _fmt_balance(amount, currency_code)
+
+    lines = []
+    if rate_info and isinstance(rate_info, dict):
+        rate = rate_info["rate"]
+        cost = amount * rate
+        lines.append(
+            f"Покупка выполнена: {amt_s} {currency_code} "
+            f"по курсу {rate:.2f} USD/{currency_code}"
+        )
+        lines.append("Изменения в портфеле:")
+        lines.append(
+            f"  - {currency_code}: "
+            f"было {old_s} -> стало {new_s}"
+        )
+        lines.append(
+            f"Оценочная стоимость покупки: "
+            f"{cost:,.2f} USD"
+        )
+    else:
+        lines.append(
+            f"Покупка выполнена: {amt_s} {currency_code}"
+        )
+        lines.append("Изменения в портфеле:")
+        lines.append(
+            f"  - {currency_code}: "
+            f"было {old_s} -> стало {new_s}"
+        )
+        lines.append(
+            f"Не удалось получить курс для "
+            f"{currency_code}->USD"
+        )
+
+    return portfolio, "\n".join(lines)
 
 
-@log_action
 def sell_currency(
     portfolio: Portfolio,
-    currency: str,
+    currency_code: str,
     amount: float,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> str:
-    """Sell a specified amount of currency for USD.
+) -> tuple[Portfolio, str]:
+    """Продать валюту (убрать из портфеля).
+
+    1. Валидировать currency и amount > 0.
+    2. Проверить наличие кошелька и достаточность средств.
+    3. Уменьшить баланс.
+    4. Показать оценочную выручку.
 
     Args:
-        portfolio: User's portfolio.
-        currency: Currency code to sell (e.g. 'ETH').
-        amount: Amount of currency to sell.
-        db: DatabaseManager instance.
-        settings: SettingsLoader instance.
+        portfolio: Портфель пользователя.
+        currency_code: Код продаваемой валюты.
+        amount: Количество.
 
     Returns:
-        Success message string.
+        Кортеж (обновлённый Portfolio, сообщение).
 
     Raises:
-        ValueError: If amount is invalid.
-        CurrencyNotFoundError: If rate is not available.
-        InsufficientFundsError: If not enough of the currency.
-        RatesExpiredError: If rates are stale.
+        ValueError: Нет кошелька, недостаточно средств,
+                    или некорректная сумма.
     """
-    currency = currency.upper()
+    currency_code = currency_code.upper()
     if amount <= 0:
-        raise ValueError("Amount must be positive")
-
-    rates = _load_and_validate_rates(db, settings)
-
-    if currency not in rates:
-        raise CurrencyNotFoundError(
-            f"No exchange rate available for '{currency}'"
+        raise ValueError(
+            "'amount' должен быть положительным числом"
         )
 
-    rate = rates[currency]
-    revenue_usd = amount * rate
+    wallet = portfolio.get_wallet(currency_code)
+    if wallet is None:
+        raise ValueError(
+            f"У вас нет кошелька '{currency_code}'. "
+            "Добавьте валюту: она создаётся "
+            "автоматически при первой покупке."
+        )
 
-    target_wallet = portfolio.get_wallet(currency)
-    target_wallet.withdraw(amount)
+    old_bal = wallet.balance
+    wallet.withdraw(amount)
+    new_bal = wallet.balance
+    _save_portfolio(portfolio)
 
-    usd_wallet = portfolio.add_currency("USD")
-    usd_wallet.deposit(revenue_usd)
+    rates = _load_rates()
+    rate_key = f"{currency_code}_USD"
+    rate_info = rates.get(rate_key)
 
-    db.save_portfolio(portfolio.user.username, portfolio.to_dict())
+    old_s = _fmt_balance(old_bal, currency_code)
+    new_s = _fmt_balance(new_bal, currency_code)
+    amt_s = _fmt_balance(amount, currency_code)
 
-    return (
-        f"Sold {amount:.4f} {currency} for {revenue_usd:.2f} USD "
-        f"(rate: 1 {currency} = {rate:.4f} USD)"
+    lines = []
+    if rate_info and isinstance(rate_info, dict):
+        rate = rate_info["rate"]
+        revenue = amount * rate
+        lines.append(
+            f"Продажа выполнена: "
+            f"{amt_s} {currency_code} "
+            f"по курсу {rate:.2f} USD/{currency_code}"
+        )
+        lines.append("Изменения в портфеле:")
+        lines.append(
+            f"  - {currency_code}: "
+            f"было {old_s} -> стало {new_s}"
+        )
+        lines.append(
+            f"Оценочная выручка: {revenue:,.2f} USD"
+        )
+    else:
+        lines.append(
+            f"Продажа выполнена: "
+            f"{amt_s} {currency_code}"
+        )
+        lines.append("Изменения в портфеле:")
+        lines.append(
+            f"  - {currency_code}: "
+            f"было {old_s} -> стало {new_s}"
+        )
+
+    return portfolio, "\n".join(lines)
+
+
+def get_rate(from_currency: str, to_currency: str) -> str:
+    """Получить курс валюты.
+
+    Ищет курс в rates.json, при необходимости
+    конвертирует через USD.
+
+    Args:
+        from_currency: Исходная валюта.
+        to_currency: Целевая валюта.
+
+    Returns:
+        Отформатированная строка с курсом.
+
+    Raises:
+        ValueError: Курс недоступен.
+    """
+    from_currency = from_currency.upper()
+    to_currency = to_currency.upper()
+
+    if not from_currency or not to_currency:
+        raise ValueError(
+            "Коды валют не могут быть пустыми"
+        )
+
+    rates = _load_rates()
+    result = _compute_rate(
+        from_currency, to_currency, rates
     )
 
-
-def get_rate(
-    currency: str,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> dict:
-    """Get the current exchange rate for a currency.
-
-    Args:
-        currency: Currency code.
-        db: DatabaseManager instance.
-        settings: SettingsLoader instance.
-
-    Returns:
-        Dict with rate info.
-
-    Raises:
-        CurrencyNotFoundError: If rate is not found.
-        RatesExpiredError: If rates are stale.
-    """
-    currency = currency.upper()
-    rates = _load_and_validate_rates(db, settings)
-
-    if currency not in rates:
-        raise CurrencyNotFoundError(
-            f"No exchange rate available for '{currency}'"
+    if result is None:
+        raise ValueError(
+            f"Курс {from_currency}->{to_currency} "
+            "недоступен. Повторите попытку позже."
         )
 
-    rates_data = db.load_rates()
-    return {
-        "currency": currency,
-        "rate_usd": rates[currency],
-        "base": "USD",
-        "updated_at": rates_data.get("updated_at", "N/A"),
-    }
+    rate_val, reverse_val, updated_at = result
+    ts = format_datetime(updated_at)
+
+    lines = [
+        f"Курс {from_currency}->{to_currency}: "
+        f"{_fmt_rate(rate_val)} "
+        f"(обновлено: {ts})",
+    ]
+    if reverse_val is not None:
+        lines.append(
+            f"Обратный курс "
+            f"{to_currency}->{from_currency}: "
+            f"{_fmt_rate(reverse_val)}"
+        )
+    return "\n".join(lines)
 
 
-def get_portfolio_info(
-    portfolio: Portfolio,
-    db: DatabaseManager,
-    settings: SettingsLoader,
-) -> dict:
-    """Compile portfolio summary with valuations.
+# ── Вспомогательные функции ──────────────────────────────
 
-    Args:
-        portfolio: User's portfolio.
-        db: DatabaseManager instance.
-        settings: SettingsLoader instance.
 
-    Returns:
-        Dict with portfolio info and total value.
-    """
-    rates_data = db.load_rates()
-    rates = rates_data.get("rates", {})
+def _load_rates() -> dict:
+    """Загрузить курсы из rates.json."""
+    data = load_json(RATES_FILE)
+    return data if isinstance(data, dict) else {}
 
-    wallets_info = []
-    for currency, wallet in portfolio.wallets.items():
-        if currency == "USD":
-            value_usd = wallet.balance
-        elif currency in rates:
-            value_usd = wallet.balance * rates[currency]
-        else:
-            value_usd = 0.0
 
-        wallets_info.append({
-            "currency": currency,
-            "balance": wallet.balance,
-            "value_usd": value_usd,
-        })
+def _load_portfolio(user_id: int) -> Portfolio:
+    """Загрузить портфель пользователя по ID."""
+    portfolios = load_json(PORTFOLIOS_FILE) or []
+    for p in portfolios:
+        if p.get("user_id") == user_id:
+            return Portfolio.from_dict(p)
+    return Portfolio(user_id=user_id)
 
-    total_value = sum(w["value_usd"] for w in wallets_info)
 
-    return {
-        "username": portfolio.user.username,
-        "wallets": wallets_info,
-        "total_value_usd": total_value,
-        "rates_updated_at": rates_data.get("updated_at", "N/A"),
-    }
+def _save_portfolio(portfolio: Portfolio) -> None:
+    """Сохранить портфель в portfolios.json."""
+    portfolios = load_json(PORTFOLIOS_FILE) or []
+    updated = False
+    for i, p in enumerate(portfolios):
+        if p.get("user_id") == portfolio.user_id:
+            portfolios[i] = portfolio.to_dict()
+            updated = True
+            break
+    if not updated:
+        portfolios.append(portfolio.to_dict())
+    save_json(PORTFOLIOS_FILE, portfolios)
+
+
+def _convert_to_base(
+    code: str,
+    balance: float,
+    base: str,
+    rates: dict,
+) -> float:
+    """Конвертировать баланс валюты в базовую."""
+    if code == base:
+        return balance
+    key = f"{code}_{base}"
+    info = rates.get(key)
+    if info and isinstance(info, dict):
+        return balance * info["rate"]
+    if base != "USD":
+        usd_key = f"{code}_USD"
+        base_key = f"{base}_USD"
+        usd_info = rates.get(usd_key)
+        base_info = rates.get(base_key)
+        if (
+            usd_info
+            and isinstance(usd_info, dict)
+            and base_info
+            and isinstance(base_info, dict)
+            and base_info["rate"] > 0
+        ):
+            val_usd = balance * usd_info["rate"]
+            return val_usd / base_info["rate"]
+    return 0.0
+
+
+def _compute_rate(
+    from_c: str, to_c: str, rates: dict
+) -> tuple[float, float | None, str | None] | None:
+    """Вычислить курс обмена между двумя валютами."""
+    if from_c == "USD":
+        key = f"{to_c}_USD"
+        info = rates.get(key)
+        if info and isinstance(info, dict):
+            to_usd = info["rate"]
+            if to_usd and to_usd > 0:
+                rate = 1.0 / to_usd
+                upd = info.get("updated_at")
+                return rate, to_usd, upd
+
+    elif to_c == "USD":
+        key = f"{from_c}_USD"
+        info = rates.get(key)
+        if info and isinstance(info, dict):
+            rate = info["rate"]
+            if rate and rate > 0:
+                upd = info.get("updated_at")
+                return rate, 1.0 / rate, upd
+
+    else:
+        f_key = f"{from_c}_USD"
+        t_key = f"{to_c}_USD"
+        f_info = rates.get(f_key)
+        t_info = rates.get(t_key)
+        if (
+            f_info
+            and isinstance(f_info, dict)
+            and t_info
+            and isinstance(t_info, dict)
+        ):
+            f_usd = f_info["rate"]
+            t_usd = t_info["rate"]
+            if f_usd and t_usd and t_usd > 0:
+                rate = f_usd / t_usd
+                rev = t_usd / f_usd if f_usd > 0 else None
+                upd = f_info.get("updated_at")
+                return rate, rev, upd
+
+    return None
+
+
+def _fmt_rate(value: float) -> str:
+    """Форматировать значение курса."""
+    if abs(value) >= 1:
+        return f"{value:.2f}"
+    return f"{value:.8f}"
+
+
+def _fmt_balance(value: float, currency: str) -> str:
+    """Форматировать баланс валюты."""
+    if currency.upper() in _CRYPTO:
+        return f"{value:.4f}"
+    return f"{value:.2f}"
