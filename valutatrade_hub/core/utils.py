@@ -1,54 +1,12 @@
-"""Вспомогательные функции: JSON I/O, хеширование, генерация ID."""
+"""Вспомогательные функции: хеширование, генерация ID, форматирование.
+
+Валидация валютных кодов, конвертации.
+JSON I/O перенесён в infra/database.py.
+"""
 
 import hashlib
-import json
 import os
 from datetime import datetime
-
-# ── Пути к файлам данных ─────────────────────────────────
-
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_HUB_DIR = os.path.dirname(_THIS_DIR)
-_PROJECT_ROOT = os.path.dirname(_HUB_DIR)
-DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
-
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-PORTFOLIOS_FILE = os.path.join(DATA_DIR, "portfolios.json")
-RATES_FILE = os.path.join(DATA_DIR, "rates.json")
-
-
-# ── JSON I/O ─────────────────────────────────────────────
-
-
-def load_json(filepath: str) -> object:
-    """Загрузить данные из JSON-файла.
-
-    Args:
-        filepath: Путь к файлу.
-
-    Returns:
-        Распарсенные данные или None если файл не найден.
-    """
-    if not os.path.exists(filepath):
-        return None
-    with open(filepath, encoding="utf-8") as fh:
-        try:
-            return json.load(fh)
-        except json.JSONDecodeError:
-            return None
-
-
-def save_json(filepath: str, data: object) -> None:
-    """Сохранить данные в JSON-файл с форматированием.
-
-    Args:
-        filepath: Путь к файлу.
-        data: Данные для сохранения.
-    """
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-
 
 # ── Хеширование паролей ──────────────────────────────────
 
@@ -109,3 +67,30 @@ def format_datetime(iso_str: str | None) -> str:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, TypeError):
         return str(iso_str)
+
+
+# ── Валидация ────────────────────────────────────────────
+
+
+def validate_currency_code(code: str) -> str:
+    """Валидировать и нормализовать код валюты.
+
+    Args:
+        code: Код валюты.
+
+    Returns:
+        Код в верхнем регистре.
+
+    Raises:
+        ValueError: Если код некорректен.
+    """
+    if not code or not code.strip():
+        raise ValueError("Код валюты не может быть пустым")
+    code = code.strip().upper()
+    if len(code) < 2 or len(code) > 5:
+        raise ValueError("Код валюты: 2-5 символов")
+    if " " in code:
+        raise ValueError(
+            "Код валюты не может содержать пробелы"
+        )
+    return code

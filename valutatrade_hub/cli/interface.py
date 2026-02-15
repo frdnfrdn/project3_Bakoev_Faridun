@@ -1,141 +1,135 @@
-"""Командный интерфейс (CLI) для ValutaTrade Hub.
+"""Командный интерфейс (CLI) ValutaTrade Hub.
 
-CLI является единственной точкой входа для пользовательских
-команд. Внутри CLI не дублируется бизнес-логика — только
-вызовы методов из core/usecases.py.
+Поддержка команд с --flag аргументами.
+Обработка пользовательских исключений:
+- InsufficientFundsError -> текст ошибки как есть.
+- CurrencyNotFoundError -> список валют + help.
+- ApiRequestError -> совет повторить позже.
 """
 
+import platform
 import shlex
-import sys
 
-from valutatrade_hub.core import usecases
+from valutatrade_hub.core.currencies import (
+    get_supported_codes,
+)
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
+    CurrencyNotFoundError,
+    InsufficientFundsError,
+)
 from valutatrade_hub.core.models import Portfolio, User
+from valutatrade_hub.core.usecases import (
+    buy_currency,
+    get_rate,
+    login_user,
+    register_user,
+    sell_currency,
+    show_portfolio,
+)
 
 HELP_TEXT = """
 Доступные команды:
   register --username <имя> --password <пароль>
+      Регистрация нового пользователя
   login --username <имя> --password <пароль>
-  logout
+      Вход в систему
   show-portfolio [--base <валюта>]
+      Показать портфель (требует входа)
   buy --currency <код> --amount <кол-во>
+      Купить валюту (требует входа)
   sell --currency <код> --amount <кол-во>
-  get-rate --from <валюта> --to <валюта>
+      Продать валюту (требует входа)
+  get-rate --from <код> --to <код>
+      Показать курс обмена
+  currencies
+      Список поддерживаемых валют
   help
-  exit / quit
+      Эта справка
+  exit
+      Выход
 """.strip()
 
 
 def run_cli() -> None:
-    """Главный цикл командного интерфейса."""
+    """Главный цикл CLI-приложения."""
+    print("=== ValutaTrade Hub ===")
+    print("Введите 'help' для списка команд.\n")
+
     current_user: User | None = None
     current_portfolio: Portfolio | None = None
 
-    print("=" * 50)
-    print("  ValutaTrade Hub")
-    print("  Введите 'help' для списка команд.")
-    print("=" * 50)
-
     while True:
         try:
-            prompt = ""
-            if current_user:
-                prompt = f"[{current_user.username}] "
-            raw = input(f"\n{prompt}> ").strip()
-            if not raw:
-                continue
-
-            cmd, args = _parse_input(raw)
-            flags = _parse_flags(args)
-
-            if cmd in ("exit", "quit"):
-                print("До свидания!")
-                break
-
-            if cmd == "help":
-                print(HELP_TEXT)
-
-            elif cmd == "register":
-                _handle_register(flags)
-
-            elif cmd == "login":
-                result = _handle_login(flags)
-                if result:
-                    current_user = result[0]
-                    current_portfolio = result[1]
-
-            elif cmd == "logout":
-                current_user = None
-                current_portfolio = None
-                print("Вы вышли из аккаунта.")
-
-            elif cmd == "show-portfolio":
-                _require_login(current_user)
-                _handle_show_portfolio(
-                    current_user,
-                    current_portfolio,
-                    flags,
-                )
-
-            elif cmd == "buy":
-                _require_login(current_user)
-                current_portfolio = _handle_buy(
-                    current_portfolio, flags
-                )
-
-            elif cmd == "sell":
-                _require_login(current_user)
-                current_portfolio = _handle_sell(
-                    current_portfolio, flags
-                )
-
-            elif cmd == "get-rate":
-                _handle_get_rate(flags)
-
-            else:
-                print(
-                    f"Неизвестная команда: '{cmd}'. "
-                    "Введите 'help' для справки."
-                )
-
-        except KeyboardInterrupt:
-            print("\nДо свидания!")
+            raw = input("vtHub> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nВыход.")
             break
-        except EOFError:
-            print("\nДо свидания!")
+
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        cmd, args = _parse_input(raw)
+
+        if cmd == "exit":
+            print("До свидания!")
             break
-        except ValueError as exc:
-            print(f"Ошибка: {exc}")
+        elif cmd == "help":
+            print(HELP_TEXT)
+        elif cmd == "currencies":
+            _handle_currencies()
+        elif cmd == "register":
+            _handle_register(args)
+        elif cmd == "login":
+            current_user, current_portfolio = (
+                _handle_login(args)
+                or (current_user, current_portfolio)
+            )
+        elif cmd == "show-portfolio":
+            _handle_show_portfolio(
+                args, current_user, current_portfolio
+            )
+        elif cmd == "buy":
+            result = _handle_buy(
+                args, current_user, current_portfolio
+            )
+            if result:
+                current_portfolio = result
+        elif cmd == "sell":
+            result = _handle_sell(
+                args, current_user, current_portfolio
+            )
+            if result:
+                current_portfolio = result
+        elif cmd == "get-rate":
+            _handle_get_rate(args)
+        else:
+            print(
+                f"Неизвестная команда: '{cmd}'. "
+                "Введите 'help'."
+            )
 
 
 # ── Парсинг ввода ────────────────────────────────────────
 
 
-def _parse_input(
-    raw: str,
-) -> tuple[str, list[str]]:
-    """Разобрать строку на команду и аргументы.
-
-    Использует shlex для безопасного разбора строки.
-    На Windows отключает POSIX-режим для совместимости.
-    """
-    posix = sys.platform != "win32"
-    parts = shlex.split(raw, posix=posix)
-    if not parts:
+def _parse_input(raw: str) -> tuple[str, list[str]]:
+    """Разбить строку на команду и аргументы."""
+    posix = platform.system() != "Windows"
+    try:
+        tokens = shlex.split(raw, posix=posix)
+    except ValueError:
+        tokens = raw.split()
+    if not tokens:
         return "", []
-    return parts[0].lower(), parts[1:]
+    return tokens[0].lower(), tokens[1:]
 
 
 def _parse_flags(
     args: list[str],
 ) -> dict[str, str]:
-    """Разобрать аргументы вида --key value в словарь.
-
-    Args:
-        args: Список токенов после команды.
-
-    Returns:
-        Словарь {ключ: значение}.
-    """
+    """Разобрать аргументы вида --key value в словарь."""
     flags: dict[str, str] = {}
     i = 0
     while i < len(args):
@@ -156,23 +150,31 @@ def _parse_flags(
     return flags
 
 
-def _require_login(user: User | None) -> None:
-    """Проверить, что пользователь авторизован.
+# ── Проверка авторизации ─────────────────────────────────
 
-    Raises:
-        ValueError: Если не выполнен login.
-    """
-    if user is None:
-        raise ValueError("Сначала выполните login")
+
+def _require_login(
+    user: User | None,
+    portfolio: Portfolio | None,
+) -> bool:
+    """Проверить, что пользователь авторизован."""
+    if user is None or portfolio is None:
+        print(
+            "Ошибка: сначала войдите "
+            "(login --username ... --password ...)"
+        )
+        return False
+    return True
 
 
 # ── Обработчики команд ───────────────────────────────────
 
 
-def _handle_register(flags: dict) -> None:
+def _handle_register(args: list[str]) -> None:
     """Обработать команду register."""
-    username = flags.get("username", "").strip()
-    password = flags.get("password", "").strip()
+    flags = _parse_flags(args)
+    username = flags.get("username", "")
+    password = flags.get("password", "")
 
     if not username or not password:
         print(
@@ -181,16 +183,20 @@ def _handle_register(flags: dict) -> None:
         )
         return
 
-    msg = usecases.register_user(username, password)
-    print(msg)
+    try:
+        msg = register_user(username, password)
+        print(msg)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
 
 
 def _handle_login(
-    flags: dict,
+    args: list[str],
 ) -> tuple[User, Portfolio] | None:
     """Обработать команду login."""
-    username = flags.get("username", "").strip()
-    password = flags.get("password", "").strip()
+    flags = _parse_flags(args)
+    username = flags.get("username", "")
+    password = flags.get("password", "")
 
     if not username or not password:
         print(
@@ -199,93 +205,171 @@ def _handle_login(
         )
         return None
 
-    user, portfolio = usecases.login_user(
-        username, password
-    )
-    print(f"Вы вошли как '{username}'")
-    return user, portfolio
+    try:
+        user, portfolio = login_user(
+            username, password
+        )
+        print(
+            f"Добро пожаловать, {user.username}! "
+            f"(id={user.user_id})"
+        )
+        return user, portfolio
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+        return None
 
 
 def _handle_show_portfolio(
-    user: User,
-    portfolio: Portfolio,
-    flags: dict,
+    args: list[str],
+    user: User | None,
+    portfolio: Portfolio | None,
 ) -> None:
     """Обработать команду show-portfolio."""
+    if not _require_login(user, portfolio):
+        return
+
+    flags = _parse_flags(args)
     base = flags.get("base", "USD").upper()
-    result = usecases.show_portfolio(
-        user, portfolio, base
-    )
-    print(result)
+
+    print(show_portfolio(user, portfolio, base))
 
 
 def _handle_buy(
-    portfolio: Portfolio, flags: dict
-) -> Portfolio:
+    args: list[str],
+    user: User | None,
+    portfolio: Portfolio | None,
+) -> Portfolio | None:
     """Обработать команду buy."""
-    currency = flags.get("currency", "").strip().upper()
-    amount_str = flags.get("amount", "").strip()
+    if not _require_login(user, portfolio):
+        return None
+
+    flags = _parse_flags(args)
+    currency = flags.get("currency", "")
+    amount_str = flags.get("amount", "")
 
     if not currency or not amount_str:
         print(
             "Использование: buy "
             "--currency <код> --amount <кол-во>"
         )
-        return portfolio
+        return None
 
     try:
         amount = float(amount_str)
     except ValueError:
-        raise ValueError(
-            f"'{amount_str}' не является числом"
-        ) from None
+        print(f"Ошибка: '{amount_str}' не число")
+        return None
 
-    portfolio, msg = usecases.buy_currency(
-        portfolio, currency, amount
-    )
-    print(msg)
-    return portfolio
+    try:
+        updated, msg = buy_currency(
+            portfolio, currency, amount
+        )
+        print(msg)
+        return updated
+    except CurrencyNotFoundError as exc:
+        _print_currency_error(exc)
+        return None
+    except InsufficientFundsError as exc:
+        print(f"Ошибка: {exc}")
+        return None
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+        return None
 
 
 def _handle_sell(
-    portfolio: Portfolio, flags: dict
-) -> Portfolio:
+    args: list[str],
+    user: User | None,
+    portfolio: Portfolio | None,
+) -> Portfolio | None:
     """Обработать команду sell."""
-    currency = flags.get("currency", "").strip().upper()
-    amount_str = flags.get("amount", "").strip()
+    if not _require_login(user, portfolio):
+        return None
+
+    flags = _parse_flags(args)
+    currency = flags.get("currency", "")
+    amount_str = flags.get("amount", "")
 
     if not currency or not amount_str:
         print(
             "Использование: sell "
             "--currency <код> --amount <кол-во>"
         )
-        return portfolio
+        return None
 
     try:
         amount = float(amount_str)
     except ValueError:
-        raise ValueError(
-            f"'{amount_str}' не является числом"
-        ) from None
+        print(f"Ошибка: '{amount_str}' не число")
+        return None
 
-    portfolio, msg = usecases.sell_currency(
-        portfolio, currency, amount
-    )
-    print(msg)
-    return portfolio
+    try:
+        updated, msg = sell_currency(
+            portfolio, currency, amount
+        )
+        print(msg)
+        return updated
+    except CurrencyNotFoundError as exc:
+        _print_currency_error(exc)
+        return None
+    except InsufficientFundsError as exc:
+        print(f"Ошибка: {exc}")
+        return None
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+        return None
 
 
-def _handle_get_rate(flags: dict) -> None:
+def _handle_get_rate(args: list[str]) -> None:
     """Обработать команду get-rate."""
-    from_c = flags.get("from", "").strip().upper()
-    to_c = flags.get("to", "").strip().upper()
+    flags = _parse_flags(args)
+    from_cur = flags.get("from", "")
+    to_cur = flags.get("to", "")
 
-    if not from_c or not to_c:
+    if not from_cur or not to_cur:
         print(
             "Использование: get-rate "
-            "--from <валюта> --to <валюта>"
+            "--from <код> --to <код>"
         )
         return
 
-    result = usecases.get_rate(from_c, to_c)
-    print(result)
+    try:
+        print(get_rate(from_cur, to_cur))
+    except CurrencyNotFoundError as exc:
+        _print_currency_error(exc)
+    except ApiRequestError as exc:
+        print(f"Ошибка: {exc}")
+        print(
+            "Повторите попытку позже "
+            "или проверьте сеть."
+        )
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+
+
+def _handle_currencies() -> None:
+    """Показать список поддерживаемых валют."""
+    codes = get_supported_codes()
+    print(
+        "Поддерживаемые валюты: "
+        + ", ".join(codes)
+    )
+
+
+# ── Вспомогательные ──────────────────────────────────────
+
+
+def _print_currency_error(
+    exc: CurrencyNotFoundError,
+) -> None:
+    """Вывести ошибку о неизвестной валюте."""
+    print(f"Ошибка: {exc}")
+    codes = get_supported_codes()
+    print(
+        "Поддерживаемые валюты: "
+        + ", ".join(codes)
+    )
+    print(
+        "Используйте 'get-rate --from <код> "
+        "--to <код>' для проверки курса."
+    )

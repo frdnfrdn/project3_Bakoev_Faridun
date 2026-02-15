@@ -2,6 +2,9 @@
 
 from datetime import datetime
 
+from valutatrade_hub.core.exceptions import (
+    InsufficientFundsError,
+)
 from valutatrade_hub.core.utils import (
     generate_salt,
     hash_password,
@@ -93,8 +96,6 @@ class User:
     def change_password(self, new_password: str) -> None:
         """Изменить пароль пользователя.
 
-        Генерирует новую соль и перехеширует пароль.
-
         Args:
             new_password: Новый пароль (мин. 4 символа).
 
@@ -111,14 +112,7 @@ class User:
         )
 
     def verify_password(self, password: str) -> bool:
-        """Проверить введённый пароль на совпадение.
-
-        Args:
-            password: Пароль для проверки.
-
-        Returns:
-            True если пароль совпадает, иначе False.
-        """
+        """Проверить введённый пароль на совпадение."""
         return self._hashed_password == hash_password(
             password, self._salt
         )
@@ -143,7 +137,9 @@ class User:
             username=data["username"],
             hashed_password=data["hashed_password"],
             salt=data["salt"],
-            registration_date=data.get("registration_date"),
+            registration_date=data.get(
+                "registration_date"
+            ),
         )
 
     def __repr__(self) -> str:
@@ -157,8 +153,9 @@ class User:
 class Wallet:
     """Кошелёк для одной конкретной валюты.
 
-    Баланс защищён через @property с проверкой на
-    отрицательные значения и некорректные типы.
+    Баланс защищён через @property с проверкой
+    на отрицательные значения и некорректные типы.
+    При недостатке средств — InsufficientFundsError.
     """
 
     def __init__(
@@ -167,8 +164,8 @@ class Wallet:
         """Инициализировать кошелёк.
 
         Args:
-            currency_code: Код валюты (например, USD, BTC).
-            balance: Начальный баланс (по умолчанию 0.0).
+            currency_code: Код валюты.
+            balance: Начальный баланс (по умолч. 0.0).
         """
         self.currency_code = currency_code.upper()
         self._balance: float = 0.0
@@ -181,11 +178,7 @@ class Wallet:
 
     @balance.setter
     def balance(self, value: float) -> None:
-        """Установить баланс с валидацией.
-
-        Raises:
-            ValueError: Если значение не число или < 0.
-        """
+        """Установить баланс с валидацией."""
         if not isinstance(value, (int, float)):
             raise ValueError(
                 "Баланс должен быть числом, "
@@ -206,7 +199,10 @@ class Wallet:
         Raises:
             ValueError: Если amount не положительное число.
         """
-        if not isinstance(amount, (int, float)) or amount <= 0:
+        if (
+            not isinstance(amount, (int, float))
+            or amount <= 0
+        ):
             raise ValueError(
                 "Сумма пополнения должна быть "
                 "положительным числом"
@@ -220,30 +216,27 @@ class Wallet:
             amount: Сумма снятия (> 0).
 
         Raises:
-            ValueError: Если amount некорректен или
-                        недостаточно средств.
+            ValueError: Если amount некорректен.
+            InsufficientFundsError: Недостаточно средств.
         """
-        if not isinstance(amount, (int, float)) or amount <= 0:
+        if (
+            not isinstance(amount, (int, float))
+            or amount <= 0
+        ):
             raise ValueError(
                 "Сумма снятия должна быть "
                 "положительным числом"
             )
         if amount > self._balance:
-            raise ValueError(
-                f"Недостаточно средств: "
-                f"доступно {self._balance:.4f} "
-                f"{self.currency_code}, "
-                f"требуется {amount:.4f} "
-                f"{self.currency_code}"
+            raise InsufficientFundsError(
+                available=self._balance,
+                required=amount,
+                code=self.currency_code,
             )
         self._balance -= amount
 
     def get_balance_info(self) -> str:
-        """Информация о текущем балансе.
-
-        Returns:
-            Строка вида 'BTC: 0.0500'.
-        """
+        """Информация о текущем балансе."""
         return f"{self.currency_code}: {self._balance:.4f}"
 
     # ── Сериализация ──────────────────────────────────
@@ -256,12 +249,7 @@ class Wallet:
     def from_dict(
         cls, currency_code: str, data: dict
     ) -> "Wallet":
-        """Создать кошелёк из словаря.
-
-        Args:
-            currency_code: Код валюты.
-            data: Словарь с ключом 'balance'.
-        """
+        """Создать кошелёк из словаря."""
         return cls(
             currency_code=currency_code,
             balance=data.get("balance", 0.0),
@@ -278,7 +266,7 @@ class Wallet:
 class Portfolio:
     """Портфель — все кошельки одного пользователя.
 
-    Обеспечивает уникальность валют и расчёт общей стоимости.
+    Обеспечивает уникальность валют и расчёт стоимости.
     """
 
     def __init__(
@@ -324,14 +312,7 @@ class Portfolio:
     def get_wallet(
         self, currency_code: str
     ) -> Wallet | None:
-        """Получить кошелёк по коду валюты.
-
-        Args:
-            currency_code: Код валюты.
-
-        Returns:
-            Объект Wallet или None если не найден.
-        """
+        """Получить кошелёк по коду валюты."""
         return self._wallets.get(currency_code.upper())
 
     def get_total_value(
@@ -339,18 +320,7 @@ class Portfolio:
         rates: dict,
         base_currency: str = "USD",
     ) -> float:
-        """Общая стоимость портфеля в базовой валюте.
-
-        Конвертирует все балансы в base_currency через
-        курсы из rates.json.
-
-        Args:
-            rates: Словарь курсов из rates.json.
-            base_currency: Базовая валюта (по умолч. USD).
-
-        Returns:
-            Суммарная стоимость.
-        """
+        """Общая стоимость портфеля в базовой валюте."""
         total = 0.0
         for code, wallet in self._wallets.items():
             if wallet.balance == 0:
@@ -381,8 +351,12 @@ class Portfolio:
         """Создать портфель из словаря."""
         user_id = data["user_id"]
         wallets = {}
-        for code, w_data in data.get("wallets", {}).items():
-            wallets[code] = Wallet.from_dict(code, w_data)
+        for code, w_data in data.get(
+            "wallets", {}
+        ).items():
+            wallets[code] = Wallet.from_dict(
+                code, w_data
+            )
         return cls(user_id=user_id, wallets=wallets)
 
     def __repr__(self) -> str:

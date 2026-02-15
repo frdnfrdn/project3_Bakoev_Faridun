@@ -193,6 +193,7 @@ cython_debug/
 
 # Project logs
 data/*.log
+logs/
 
 # PyPI configuration file
 .pypirc
