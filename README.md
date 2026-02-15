@@ -115,6 +115,12 @@ poetry run project
 | `help` | Справка по командам |
 | `exit` | Выход из приложения |
 
+## Демо
+
+[![asciicast](https://asciinema.org/a/68U4st9g1jCMVcRf.svg)](https://asciinema.org/a/68U4st9g1jCMVcRf)
+
+Полный цикл: register -> login -> buy/sell -> show-portfolio -> get-rate -> update-rates -> show-rates, включая обработку ошибок (недостаточно средств, неизвестная валюта).
+
 ## Примеры работы
 
 ### Регистрация и покупка
