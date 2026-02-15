@@ -11,6 +11,8 @@ import platform
 import shlex
 
 from valutatrade_hub.core.currencies import (
+    CryptoCurrency,
+    get_currency,
     get_supported_codes,
 )
 from valutatrade_hub.core.exceptions import (
@@ -27,6 +29,9 @@ from valutatrade_hub.core.usecases import (
     sell_currency,
     show_portfolio,
 )
+from valutatrade_hub.infra.database import (
+    DatabaseManager,
+)
 
 HELP_TEXT = """
 Доступные команды:
@@ -42,6 +47,10 @@ HELP_TEXT = """
       Продать валюту (требует входа)
   get-rate --from <код> --to <код>
       Показать курс обмена
+  update-rates [--source <coingecko|exchangerate>]
+      Обновить курсы валют из внешних API
+  show-rates [--currency <код>] [--top <N>] [--base <валюта>]
+      Показать актуальные курсы из кеша
   currencies
       Список поддерживаемых валют
   help
@@ -104,6 +113,10 @@ def run_cli() -> None:
                 current_portfolio = result
         elif cmd == "get-rate":
             _handle_get_rate(args)
+        elif cmd == "update-rates":
+            _handle_update_rates(args)
+        elif cmd == "show-rates":
+            _handle_show_rates(args)
         else:
             print(
                 f"Неизвестная команда: '{cmd}'. "
@@ -347,6 +360,148 @@ def _handle_get_rate(args: list[str]) -> None:
         print(f"Ошибка: {exc}")
 
 
+def _handle_update_rates(args: list[str]) -> None:
+    """Обработать команду update-rates.
+
+    Запуск немедленного обновления курсов
+    из внешних API (CoinGecko, ExchangeRate-API).
+    """
+    from valutatrade_hub.parser_service.api_clients import (
+        CoinGeckoClient,
+        ExchangeRateApiClient,
+    )
+    from valutatrade_hub.parser_service.config import (
+        ParserConfig,
+    )
+    from valutatrade_hub.parser_service.storage import (
+        RatesStorage,
+    )
+    from valutatrade_hub.parser_service.updater import (
+        RatesUpdater,
+    )
+
+    flags = _parse_flags(args)
+    source = flags.get("source", "").lower()
+
+    config = ParserConfig()
+    storage = RatesStorage()
+
+    clients = []
+    if not source or source == "coingecko":
+        clients.append(CoinGeckoClient(config))
+    if not source or source == "exchangerate":
+        clients.append(
+            ExchangeRateApiClient(config)
+        )
+
+    if not clients:
+        print(
+            "Неизвестный источник. "
+            "Допустимые: coingecko, exchangerate"
+        )
+        return
+
+    print("INFO: Starting rates update...")
+
+    updater = RatesUpdater(clients, storage)
+    result = updater.run_update()
+
+    for name, count in result["sources"].items():
+        print(
+            f"INFO: Fetching from {name}... "
+            f"OK ({count} rates)"
+        )
+    for error in result["errors"]:
+        print(f"ERROR: {error}")
+
+    total = result["total_rates"]
+    if total:
+        print(
+            f"INFO: Writing {total} rates "
+            "to data/rates.json..."
+        )
+        print(
+            f"Update successful. "
+            f"Total rates updated: {total}. "
+            f"Last refresh: "
+            f"{result['last_refresh']}"
+        )
+    elif result["errors"]:
+        print(
+            "Update completed with errors. "
+            "Check logs/actions.log for details."
+        )
+    else:
+        print("No rates updated.")
+
+
+def _handle_show_rates(args: list[str]) -> None:
+    """Обработать команду show-rates.
+
+    Показать актуальные курсы из локального кеша
+    с фильтрацией по валюте, top-N, базовой валюте.
+    """
+    flags = _parse_flags(args)
+    currency_filter = flags.get(
+        "currency", ""
+    ).upper()
+    top_str = flags.get("top", "")
+    base = flags.get("base", "USD").upper()
+
+    db = DatabaseManager()
+    rates = db.load_rates()
+    pairs = rates.get("pairs", {})
+    last_refresh = rates.get(
+        "last_refresh", "неизвестно"
+    )
+
+    if not pairs:
+        print(
+            "Локальный кеш курсов пуст. "
+            "Выполните 'update-rates', "
+            "чтобы загрузить данные."
+        )
+        return
+
+    # Фильтр по валюте
+    if currency_filter:
+        filtered = {
+            k: v
+            for k, v in pairs.items()
+            if currency_filter in k
+        }
+        if not filtered:
+            print(
+                f"Курс для '{currency_filter}' "
+                "не найден в кеше."
+            )
+            return
+        pairs = filtered
+
+    # Конвертация в другую базу
+    display = _build_display_pairs(
+        pairs, base
+    )
+
+    # Фильтр --top (только крипто)
+    if top_str:
+        display = _filter_top(display, top_str)
+
+    # Сортировка по убыванию курса
+    items = sorted(
+        display.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    print(
+        f"Rates from cache "
+        f"(updated at {last_refresh}):"
+    )
+    for key, rate_val in items:
+        print(f"  - {key}: {_fmt_display(rate_val)}")
+
+
 def _handle_currencies() -> None:
     """Показать список поддерживаемых валют."""
     codes = get_supported_codes()
@@ -373,3 +528,76 @@ def _print_currency_error(
         "Используйте 'get-rate --from <код> "
         "--to <код>' для проверки курса."
     )
+
+
+def _build_display_pairs(
+    pairs: dict, base: str
+) -> dict[str, float]:
+    """Собрать пары для отображения.
+
+    Если base != USD, конвертирует через кросс-курс.
+    """
+    if base == "USD":
+        return {
+            k: v["rate"] for k, v in pairs.items()
+        }
+
+    # Найти курс базовой валюты к USD
+    base_key = f"{base}_USD"
+    base_rate = None
+    for k, v in pairs.items():
+        if k == base_key:
+            base_rate = v["rate"]
+            break
+
+    if not base_rate:
+        return {
+            k: v["rate"] for k, v in pairs.items()
+        }
+
+    result = {}
+    for key, info in pairs.items():
+        parts = key.split("_")
+        from_cur = parts[0]
+        if from_cur == base:
+            continue
+        rate_base = info["rate"] / base_rate
+        result[f"{from_cur}_{base}"] = rate_base
+
+    return result
+
+
+def _filter_top(
+    display: dict[str, float], top_str: str
+) -> dict[str, float]:
+    """Отфильтровать top-N криптовалют."""
+    try:
+        n = int(top_str)
+    except ValueError:
+        return display
+
+    crypto_pairs = {}
+    for key, rate_val in display.items():
+        code = key.split("_")[0]
+        try:
+            curr = get_currency(code)
+            if isinstance(curr, CryptoCurrency):
+                crypto_pairs[key] = rate_val
+        except CurrencyNotFoundError:
+            pass
+
+    top = dict(
+        sorted(
+            crypto_pairs.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:n]
+    )
+    return top
+
+
+def _fmt_display(rate_val: float) -> str:
+    """Форматировать курс для отображения."""
+    if rate_val >= 1:
+        return f"{rate_val:.2f}"
+    return f"{rate_val:.5f}"

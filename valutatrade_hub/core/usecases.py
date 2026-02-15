@@ -152,9 +152,10 @@ def show_portfolio(
     """
     db = DatabaseManager()
     rates = db.load_rates()
+    pairs = _extract_pairs(rates)
 
     total = _convert_portfolio_value(
-        portfolio, rates, base_currency
+        portfolio, pairs, base_currency
     )
 
     lines = [
@@ -176,7 +177,7 @@ def show_portfolio(
             val_str = _wallet_value_str(
                 wallet.balance,
                 code,
-                rates,
+                pairs,
                 base_currency,
             )
             lines.append(
@@ -230,8 +231,9 @@ def buy_currency(
     db.save_portfolio(portfolio.to_dict())
 
     rates = db.load_rates()
+    pairs = _extract_pairs(rates)
     cost_str = _estimate_cost(
-        amount, currency_code, rates
+        amount, currency_code, pairs
     )
 
     display = currency.get_display_info()
@@ -292,8 +294,9 @@ def sell_currency(
     db.save_portfolio(portfolio.to_dict())
 
     rates = db.load_rates()
+    pairs = _extract_pairs(rates)
     revenue_str = _estimate_revenue(
-        amount, currency_code, rates
+        amount, currency_code, pairs
     )
 
     display = currency.get_display_info()
@@ -342,9 +345,10 @@ def get_rate(
     rates = db.load_rates()
 
     _check_ttl(rates)
+    pairs = _extract_pairs(rates)
 
     rate_value = _compute_rate(
-        from_currency, to_currency, rates
+        from_currency, to_currency, pairs
     )
 
     if rate_value is None:
@@ -356,7 +360,7 @@ def get_rate(
     pair = f"{from_currency}/{to_currency}"
     rate_str = _fmt_rate(rate_value)
     updated = _get_updated_at(
-        from_currency, to_currency, rates
+        from_currency, to_currency, pairs
     )
     from_info = from_curr.get_display_info()
     to_info = to_curr.get_display_info()
@@ -370,6 +374,21 @@ def get_rate(
 
 
 # ── Вспомогательные функции ──────────────────────────────
+
+
+def _extract_pairs(rates: dict) -> dict:
+    """Извлечь пары из rates (оба формата).
+
+    Новый формат: rates["pairs"] = {...}.
+    Старый формат: rates = {"EUR_USD": {...}, ...}.
+    """
+    if "pairs" in rates:
+        return rates["pairs"]
+    return {
+        k: v
+        for k, v in rates.items()
+        if isinstance(v, dict) and "rate" in v
+    }
 
 
 def _check_ttl(rates: dict) -> None:
