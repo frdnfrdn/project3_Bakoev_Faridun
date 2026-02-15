@@ -1,0 +1,39 @@
+[project]
+name = "project3-bakoev-faridun"
+version = "0.1.0"
+description = "ValutaTrade Hub — console currency wallet application"
+authors = [
+    {name = "Faridun Bakoev"},
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "prettytable (>=3.17.0,<4.0.0)",
+    "requests (>=2.32.0,<3.0.0)",
+]
+
+[project.scripts]
+project = "valutatrade_hub.main:main"
+
+[tool.poetry]
+packages = [
+    { include = "valutatrade_hub" },
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+exclude = ["venv", ".venv", "dist", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = []
+
+[dependency-groups]
+dev = [
+    "ruff (>=0.15.1,<0.16.0)",
+]
